@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from .casework_routes import router as operational_cases
+from .model_activation import ensure_schema as ensure_model_schema
 from .operations_evidence import router as operations_evidence
 from .database import Base, engine
 from .routes import router
@@ -14,6 +15,7 @@ logging.basicConfig(level=logging.INFO)
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
+    ensure_model_schema()
     if os.getenv("SEED_DEMO", "true").lower() == "true":
         seed()
     yield

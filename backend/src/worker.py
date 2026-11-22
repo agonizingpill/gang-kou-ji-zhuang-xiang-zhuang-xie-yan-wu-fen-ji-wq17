@@ -1,86 +1,152 @@
-import json, os, time
+import os
+import socket
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-import numpy as np
+from uuid import uuid4
+
 from redis import Redis
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sqlalchemy import select
+from sqlalchemy import text
+
 from .database import Base, SessionLocal, engine
+from .model_activation import ensure_schema, heartbeat, register_process, unregister_process
+from .model_registry import DEFAULT_SPEC_KEY, MODEL_SPECS, MissingFeatureError, build_model, predict
 from .models import AnalysisJob, DelayCase
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 SHARED_DIR = Path(os.getenv("SHARED_DIR", "/shared"))
 queue = Redis.from_url(REDIS_URL, decode_responses=True)
+PROCESS_ID = f"grading-{socket.gethostname()}-{uuid4().hex[:8]}"
 
-FEATURE_KEYS = ["container_count", "avg_gate_dwell_min", "max_gate_dwell_min", "reefer_ratio", "hazmat_ratio", "customs_open_count", "gate_event_count", "dry_count", "reefer_count", "hazmat_count", "port_call_hour", "window_minutes", "dwell_x_reefer", "gate_x_count"]
 
-def vector(f):
-    return np.array([[f[k] for k in FEATURE_KEYS]], dtype=float)
+def prepare_specs():
+    """Build every shipped version; only advertise versions that truly loaded."""
+    ready = []
+    for key in sorted(MODEL_SPECS):
+        try:
+            build_model(key)
+            ready.append(key)
+        except Exception as exc:  # noqa: BLE001 - surfaced through readiness, not crash
+            print(f"model {key} not prepared: {exc}", flush=True)
+    return ready
 
-def train_model():
-    rows = [
-        ([4, 8, 12, .0, .0, 0, 4, 4, 0, 0, 6, 480], "normal"),
-        ([6, 16, 22, .17, .0, 0, 6, 5, 1, 0, 8, 420], "watch"),
-        ([8, 28, 40, .25, .12, 0, 8, 5, 2, 1, 10, 360], "major"),
-        ([9, 42, 66, .33, .22, 1, 9, 4, 3, 2, 13, 300], "critical"),
-        ([5, 10, 18, .2, .0, 0, 5, 4, 1, 0, 7, 520], "normal"),
-        ([7, 22, 31, .29, .0, 0, 7, 4, 2, 0, 9, 390], "watch"),
-        ([10, 35, 51, .3, .1, 0, 10, 6, 3, 1, 11, 330], "major"),
-        ([12, 50, 78, .42, .17, 0, 12, 6, 5, 2, 14, 280], "critical"),
-        ([3, 7, 10, .0, .0, 0, 3, 3, 0, 0, 5, 600], "normal"),
-        ([8, 25, 36, .38, .0, 0, 8, 5, 3, 0, 12, 360], "major"),
-        ([5, 18, 24, .2, .2, 0, 5, 3, 1, 1, 9, 440], "watch"),
-        ([11, 45, 70, .45, .25, 0, 11, 4, 5, 2, 15, 260], "critical"),
-    ]
-    x = []
-    y = []
-    for base, label in rows:
-        f = dict(zip(FEATURE_KEYS[:12], base))
-        f["dwell_x_reefer"] = f["avg_gate_dwell_min"] * f["reefer_ratio"]
-        f["gate_x_count"] = f["gate_event_count"] * f["container_count"]
-        x.append([f[k] for k in FEATURE_KEYS]); y.append(label)
-    model = Pipeline([("scale", StandardScaler()), ("lr", LogisticRegression(max_iter=500, random_state=42, multi_class="auto"))])
-    model.fit(x, y)
-    return model
 
-MODEL = train_model()
+def claim_job(db, job_id):
+    """Atomically move a queued job to running and pin the model version it will use.
 
-def run_job(job_id):
+    A job already pinned (e.g. a queued job retargeted by activation) keeps that
+    version; a legacy queued job adopts the current active version at claim time.
+    """
+    row = db.execute(text("""
+        UPDATE analysis_jobs SET status='running',
+            model_version = COALESCE(model_version,
+                (SELECT active_spec_key FROM model_registry_state WHERE id=1))
+        WHERE id=:job_id AND status='queued'
+        RETURNING model_version
+    """), {"job_id": int(job_id)}).first()
+    db.commit()
+    return row[0] if row else None
+
+
+def pinned_version(db, job):
+    """Resolve the model version this job must use.
+
+    A queued job is claimed atomically and pinned (honouring a version already
+    assigned by activation).  A job left ``running`` by an interrupted worker
+    resumes on the version it pinned at claim time, which is the old model if
+    activation happened afterwards.
+    """
+    if job.status == "queued":
+        return claim_job(db, job.id)
+    if job.status == "running":
+        # Legacy in-flight jobs predate version pinning: they were graded by the
+        # original model, so finish them on that version rather than the new one.
+        return job.model_version or DEFAULT_SPEC_KEY
+    return None
+
+
+def validate_result(spec_key, result):
+    spec = MODEL_SPECS[spec_key]
+    missing = [level for level in spec["levels"] if level not in result["probabilities"]]
+    if missing:
+        raise ValueError("模型概率缺少等级：" + "、".join(missing))
+    total = sum(result["probabilities"].values())
+    if abs(total - 1) > 0.01:
+        raise ValueError(f"模型概率合计异常：{round(total, 4)}")
+
+
+def run_job(job_id, ready_specs):
     db = SessionLocal()
-    job = db.get(AnalysisJob, int(job_id))
-    if not job:
-        db.close(); return
-    case = db.get(DelayCase, job.case_id)
     try:
-        job.status = "running"; db.commit()
-        f = dict(job.input_summary or {})
-        f["dwell_x_reefer"] = round(f.get("avg_gate_dwell_min", 0) * f.get("reefer_ratio", 0), 3)
-        f["gate_x_count"] = f.get("gate_event_count", 0) * f.get("container_count", 0)
-        x = vector(f)
-        label = MODEL.predict(x)[0]
-        probs = MODEL.predict_proba(x)[0]
-        classes = MODEL.named_steps["lr"].classes_
-        confidence = float(max(probs))
-        result = {"label": label, "confidence": round(confidence, 4), "probabilities": {c: round(float(p), 4) for c, p in zip(classes, probs)}, "feature_keys": FEATURE_KEYS, "features": f, "formula": "手工交叉特征 = avg_gate_dwell_min×reefer_ratio, gate_event_count×container_count；StandardScaler + LogisticRegression(random_state=42)"}
-        job.result = result; job.status = "succeeded"; job.finished_at = datetime.now(timezone.utc)
-        case.model_output = result; case.final_level = label; case.status = "classified"; case.exception_reason = None
+        job = db.get(AnalysisJob, int(job_id))
+        if not job:
+            return
+        spec_key = pinned_version(db, job)
+        db.refresh(job)
+        if spec_key is None:
+            # Not queued any more (already claimed or cancelled); do nothing.
+            return
+        case = db.get(DelayCase, job.case_id)
+        if not case:
+            raise ValueError("延误案件不存在")
+        if spec_key not in ready_specs:
+            raise ValueError(f"当前分级进程未准备模型版本 {spec_key}")
+        base = dict(job.input_summary or {})
+        result = predict(spec_key, base)
+        validate_result(spec_key, result)
+        result["model_version"] = spec_key
+        result["model_label"] = MODEL_SPECS[spec_key]["label"]
+        result["formula"] = MODEL_SPECS[spec_key]["formula"]
+        job.result = result
+        job.status = "succeeded"
+        job.model_version = spec_key
+        job.finished_at = datetime.now(timezone.utc)
+        case.model_output = result
+        case.model_version = spec_key
+        case.final_level = result["label"]
+        case.status = "classified"
+        case.exception_reason = None
         db.commit()
+    except MissingFeatureError as exc:
+        db.rollback()
+        job = db.get(AnalysisJob, int(job_id))
+        if job:
+            job.status = "failed"
+            job.error = str(exc)
+            job.finished_at = datetime.now(timezone.utc)
+            db.commit()
     except Exception as exc:
-        job.status = "failed"; job.error = str(exc); job.finished_at = datetime.now(timezone.utc); db.commit()
+        db.rollback()
+        job = db.get(AnalysisJob, int(job_id))
+        if job:
+            job.status = "failed"
+            job.error = str(exc)
+            job.finished_at = datetime.now(timezone.utc)
+            db.commit()
     finally:
         db.close()
 
+
 def main():
     Base.metadata.create_all(engine)
+    ensure_schema()
     SHARED_DIR.mkdir(parents=True, exist_ok=True)
-    while True:
-        Path(SHARED_DIR / "worker-heartbeat").touch()
-        item = queue.blpop("container_delay_triage_jobs", timeout=3)
-        if item:
-            run_job(item[1])
-        time.sleep(1)
+    ready_specs = prepare_specs()
+    register_process(PROCESS_ID, ready_specs)
+    last_beat = 0.0
+    try:
+        while True:
+            Path(SHARED_DIR / "worker-heartbeat").touch()
+            now = time.time()
+            if now - last_beat > 5:
+                heartbeat(PROCESS_ID, ready_specs)
+                last_beat = now
+            item = queue.blpop("container_delay_triage_jobs", timeout=3)
+            if item:
+                run_job(item[1], ready_specs)
+    finally:
+        unregister_process(PROCESS_ID)
+
 
 if __name__ == "__main__":
     main()

@@ -1,9 +1,11 @@
 import json, os
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .database import redis_client
+from .model_activation import activate, active_spec_key, registry_view, run_acceptance
 from .models import AuditLog, AnalysisJob, ContainerCheck, DelayCase, DispatchAction, GateEvent, User, VesselCall
 from .schemas import ContainerIn, CustomsUpdate, DelayCaseIn, DispatchIn, GateIn, LoginIn, VesselIn
 from .security import current_user, get_db, hash_password, issue_token, require_roles
@@ -21,7 +23,7 @@ def vessel_dict(v: VesselCall, db):
 def case_dict(c: DelayCase, db):
     jobs = db.execute(select(AnalysisJob).where(AnalysisJob.case_id == c.id).order_by(AnalysisJob.id.desc())).scalars().all()
     actions = [{"id": a.id, "action_type": a.action_type, "assignee": a.assignee, "due_at": a.due_at.isoformat(), "status": a.status, "instruction": a.instruction} for a in c.actions]
-    return {"id": c.id, "case_no": c.case_no, "vessel_id": c.vessel_id, "vessel": c.vessel.call_no if c.vessel else "", "vessel_name": c.vessel.vessel_name if c.vessel else "", "requested_level": c.requested_level, "final_level": c.final_level, "status": c.status, "reason": c.reason, "feature_snapshot": c.feature_snapshot, "model_output": c.model_output, "exception_reason": c.exception_reason, "jobs": [{"id": j.id, "status": j.status, "result": j.result, "error": j.error, "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs], "actions": actions}
+    return {"id": c.id, "case_no": c.case_no, "vessel_id": c.vessel_id, "vessel": c.vessel.call_no if c.vessel else "", "vessel_name": c.vessel.vessel_name if c.vessel else "", "requested_level": c.requested_level, "final_level": c.final_level, "status": c.status, "reason": c.reason, "feature_snapshot": c.feature_snapshot, "model_output": c.model_output, "model_version": c.model_version, "exception_reason": c.exception_reason, "jobs": [{"id": j.id, "status": j.status, "model_version": j.model_version, "result": j.result, "error": j.error, "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs], "actions": actions}
 
 @router.post("/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
@@ -38,7 +40,7 @@ def me(user: User = Depends(current_user)):
 def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user)):
     vessels = db.execute(select(VesselCall).order_by(VesselCall.eta)).scalars().all()
     cases = db.execute(select(DelayCase).order_by(DelayCase.id.desc())).scalars().all()
-    return {"stats": {"vessels": len(vessels), "containers": db.scalar(select(func.count(ContainerCheck.id))), "open_cases": sum(1 for c in cases if c.status not in {"closed", "rejected"}), "dispatches": db.scalar(select(func.count(DispatchAction.id)))}, "vessels": [vessel_dict(v, db) for v in vessels], "cases": [case_dict(c, db) for c in cases]}
+    return {"stats": {"vessels": len(vessels), "containers": db.scalar(select(func.count(ContainerCheck.id))), "open_cases": sum(1 for c in cases if c.status not in {"closed", "rejected"}), "dispatches": db.scalar(select(func.count(DispatchAction.id)))}, "vessels": [vessel_dict(v, db) for v in vessels], "cases": [case_dict(c, db) for c in cases], "model_registry": registry_view(db)}
 
 @router.get("/vessels")
 def list_vessels(db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -115,7 +117,8 @@ def classify(case_id: int, db: Session = Depends(get_db), user: User = Depends(r
         log(db, user, "triage_blocked", "delay_case", case.id, case.exception_reason); db.commit()
         raise HTTPException(status_code=409, detail={"code": "DOMAIN_PRECHECK", "message": case.exception_reason, "case": case_dict(case, db)})
     case.status = "queued"; case.exception_reason = None
-    job = AnalysisJob(case_id=case.id, status="queued", input_summary=features)
+    job = AnalysisJob(case_id=case.id, status="queued", input_summary=features,
+                      model_version=active_spec_key(db))
     db.add(job); db.flush(); log(db, user, "triage_queued", "analysis_job", job.id, json.dumps(features, ensure_ascii=False)); db.commit()
     redis_client.rpush("container_delay_triage_jobs", str(job.id))
     return {"case": case_dict(case, db), "job_id": job.id, "message": "已排入交叉特征分级队列"}
@@ -138,3 +141,25 @@ def complete_action(action_id: int, db: Session = Depends(get_db), user: User = 
 @router.get("/audit")
 def audit(db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
     return [{"id": x.id, "actor": x.actor, "role": x.role, "action": x.action, "entity": x.entity, "detail": x.detail, "created_at": x.created_at.isoformat()} for x in db.execute(select(AuditLog).order_by(AuditLog.id.desc()).limit(80)).scalars().all()]
+
+
+class ActivateIn(BaseModel):
+    note: str = Field(default="", max_length=500)
+
+
+@router.get("/model-registry")
+def model_registry(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    return registry_view(db)
+
+
+@router.post("/model-registry/{spec_key}/acceptance")
+def model_acceptance(spec_key: str, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
+    return run_acceptance(db, spec_key)
+
+
+@router.post("/model-registry/{spec_key}/activate")
+def model_activate(spec_key: str, payload: ActivateIn, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
+    result = activate(db, spec_key, user, payload.note)
+    if result["status"] == "rejected":
+        raise HTTPException(status_code=409, detail={"code": "MODEL_ACCEPTANCE_FAILED", **result})
+    return result
